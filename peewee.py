@@ -994,9 +994,15 @@ class QueryCompiler(object):
         parts.append(select)
         params.extend(s_params)
 
-        parts.append('FROM %s AS %s' % (
-            self.quote(model._meta.db_table),
-            alias_map[model]))
+        if hasattr(model._meta.db_table, 'sql'):
+            f_part, f_params = model._meta.db_table.sql()
+            f_part = "(%s)" % f_part
+        else:
+            f_part = self.quote(model._meta.db_table)
+            f_params = []
+
+        parts.append('FROM %s AS %s' % (f_part, alias_map[model]))
+        params.extend(f_params)
 
         joins, j_params = self.generate_joins(query._joins, model, alias_map)
         if joins:
@@ -1384,6 +1390,10 @@ class Query(Node):
         if initial is None:
             return reduced
         return initial & reduced
+
+    @returns_clone
+    def db_table(self, db_table):
+        self.model_class._meta.db_table = db_table
 
     @returns_clone
     def where(self, *expressions):
