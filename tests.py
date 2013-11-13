@@ -92,12 +92,14 @@ class TestQueryCompiler(QueryCompiler):
         return 0
 
     def calculate_alias_map(self, query, start=1):
-        alias_map = {query.model_class: query.model_class._meta.db_table}
+        alias_map = {query.model_class: query.model_class._meta.db_table if not hasattr(query.model_class._meta.db_table, 'sql') else 't%s' % start}
         for model, joins in query._joins.items():
             if model not in alias_map:
+                start += 1
                 alias_map[model] = model._meta.db_table
             for join in joins:
                 if join.model_class not in alias_map:
+                    start += 1
                     alias_map[join.model_class] = join.model_class._meta.db_table
         return alias_map
 
@@ -434,6 +436,14 @@ class SelectTestCase(BasePeeweeTestCase):
             'WHERE (child."parent_id" = parent."id") GROUP BY child."parent_id") ' + \
             'AS count FROM "parent" AS parent', []
         ))
+
+    def test_select_from_subquery(self):
+        subquery = SelectQuery(Child, fn.Count(Child.id)).where(Child.parent == Parent.id).group_by(Child.parent)
+        sq = SelectQuery(Parent).db_table(RawQuery(Parent, "SELECT 1 AS id, 'abc' as data UNION SELECT 2 AS id, 'def' as data"))
+#         sq = SelectQuery(Parent).db_table(subquery)
+
+        sql = compiler.generate_select(sq)
+        print sql
 
     def test_select_subquery_ordering(self):
         sq = Comment.select().join(Blog).where(Blog.pk == 1)
