@@ -658,7 +658,7 @@ class ReverseRelationDescriptor(object):
 
     def __get__(self, instance, instance_type=None):
         if instance is not None:
-            return self.rel_model.select().where(self.field==instance.get_id())
+            return self.rel_model.select().where(self.field == instance.get_id())
         return self
 
 class ForeignKeyField(IntegerField):
@@ -912,7 +912,7 @@ class QueryCompiler(object):
             # here, if the node is *not* a special object, we'll pass thru
             # parse_node and let db_value handle it
             if not isinstance(value, (Node, Model, Query)):
-                value = Param(value)  # passthru to the field's db_value func
+                value = Param(value) # passthru to the field's db_value func
             val_sql, val_params = self.parse_node(value)
             val_params = [field.db_value(vp) for vp in val_params]
             sets.append((field_sql, val_sql))
@@ -964,15 +964,22 @@ class QueryCompiler(object):
                         right_field = field
                     join_node = (left_field == right_field)
 
+                if hasattr(dest._meta.db_table, 'sql'):
+                    f_part, f_params = dest._meta.db_table.sql()
+                    f_part = "(%s)" % f_part
+                else:
+                    f_part = self.quote(dest._meta.db_table)
+                    f_params = []
+
                 join_type = join.join_type or JOIN_INNER
                 join_sql, join_params = self.parse_node(join_node, alias_map)
-
+                f_params.extend(join_params)
                 sql.append('%s JOIN %s AS %s ON %s' % (
                     self.join_map[join_type],
-                    self.quote(dest._meta.db_table),
+                    f_part,
                     alias_map[dest],
                     join_sql))
-                params.extend(join_params)
+                params.extend(f_params)
 
                 q.append(dest)
         return sql, params
@@ -2155,7 +2162,7 @@ class MySQLDatabase(Database):
     }
     for_update = True
     interpolation = '%s'
-    limit_max = 2 ** 64 - 1  # MySQL quirk
+    limit_max = 2 ** 64 - 1 # MySQL quirk
     op_overrides = {
         OP_LIKE: 'LIKE BINARY',
         OP_ILIKE: 'LIKE',
@@ -2728,9 +2735,9 @@ def sort_models_topologically(models):
             seen.add(model)
             for foreign_key in model._meta.reverse_rel.values():
                 dfs(foreign_key.model_class)
-            ordering.append(model)  # parent will follow descendants
+            ordering.append(model) # parent will follow descendants
     # order models by name and table initially to guarantee a total ordering
     names = lambda m: (m._meta.name, m._meta.db_table)
     for m in sorted(models, key=names, reverse=True):
         dfs(m)
-    return list(reversed(ordering))  # want parents first in output ordering
+    return list(reversed(ordering)) # want parents first in output ordering
