@@ -53,6 +53,10 @@ class RelModel(BaseModel):
 class FKPK(BaseModel):
     col_types = ForeignKeyField(ColTypes, primary_key=True)
 
+class Underscores(BaseModel):
+    _id = PrimaryKeyField()
+    _name = CharField()
+
 
 DATABASES = (
     (sqlite_db, 'sqlite'),
@@ -64,12 +68,10 @@ MODELS = (
     ColTypes,
     Nullable,
     RelModel,
-    FKPK)
+    FKPK,
+    Underscores)
 
 class TestPwiz(unittest.TestCase):
-    def setUp(self):
-        pass
-
     def create_tables(self, db):
         for model in MODELS:
             model._meta.database = db
@@ -116,7 +118,10 @@ class TestPwiz(unittest.TestCase):
                 ('nullable_cf', CharField, True),
                 ('nullable_if', IntegerField, True))),
             ('fkpk', (
-                ('col_types_id', ForeignKeyField, False),))
+                ('col_types_id', ForeignKeyField, False),)),
+            ('underscores', (
+                ('_id', PrimaryKeyField, False),
+                ('_name', CharField, False))),
         )
 
         for table, table_cols in expected:
@@ -129,7 +134,9 @@ class TestPwiz(unittest.TestCase):
                     column_info.field_class in klass,
                     '[%s] %s %s not in %s' % (
                         db_name, table, column_info.field_class, klass))
-                self.assertEqual(column_info.nullable, nullable)
+                self.assertEqual(
+                    column_info.kwargs.get('null', False),
+                    nullable)
 
     @generative_test
     def test_foreign_keys(self, database, db_name):
@@ -168,7 +175,7 @@ class TestPwiz(unittest.TestCase):
         self.assertEqual(rm_meta['col_types_nullable_id'], {
             'db_column': "'col_types_nullable_id'",
             'rel_model': 'Coltypes',
-            'null': 'True'})
+            'null': True})
 
         fkpk_meta = col_meta['fkpk']
         self.assertEqual(fkpk_meta['col_types_id'], {

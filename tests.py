@@ -62,7 +62,6 @@ if BACKEND == 'postgresql':
     database_class = PostgresqlDatabase
     database_name = 'peewee_test'
     import psycopg2
-    OperationalError = psycopg2.OperationalError
 elif BACKEND == 'mysql':
     database_class = MySQLDatabase
     database_name = 'peewee_test'
@@ -70,7 +69,6 @@ elif BACKEND == 'mysql':
         import MySQLdb as mysql
     except ImportError:
         import pymysql as mysql
-    OperationalError = mysql.OperationalError
 elif BACKEND == 'apsw':
     from playhouse.apsw_ext import *
     database_class = APSWDatabase
@@ -80,7 +78,6 @@ else:
     database_class = SqliteDatabase
     database_name = 'tmp.db'
     import sqlite3
-    OperationalError = sqlite3.OperationalError
     print_('SQLITE VERSION: %s' % sqlite3.version)
 
 #
@@ -811,6 +808,20 @@ class SelectTestCase(BasePeeweeTestCase):
         ]
         for (query, fkf), expected in zip(fixed, fixed_sql):
             self.assertEqual(normal_compiler.generate_select(query), expected)
+
+    def test_outer_inner_alias(self):
+        expected = 'SELECT t1."id", t1."username", (SELECT Sum(t2."id") FROM "users" AS t2 WHERE (t2."id" = t1."id")) AS xxx FROM "users" AS t1'
+        UA = User.alias()
+        inner = SelectQuery(UA, fn.Sum(UA.id)).where(UA.id == User.id)
+        query = User.select(User, inner.alias('xxx'))
+        sql, _ = normal_compiler.generate_select(query)
+        self.assertEqual(sql, expected)
+
+        # Ensure that ModelAlias.select() does the right thing.
+        inner = UA.select(fn.Sum(UA.id)).where(UA.id == User.id)
+        query = User.select(User, inner.alias('xxx'))
+        sql, _ = normal_compiler.generate_select(query)
+        self.assertEqual(sql, expected)
 
 class UpdateTestCase(BasePeeweeTestCase):
     def test_update(self):
@@ -1764,6 +1775,9 @@ class ModelAPITestCase(ModelTestCase):
         uc = User.select().where(User.username == 'u1').join(Blog).distinct().count()
         self.assertEqual(uc, 1)
 
+        self.assertEqual(
+            User.select().limit(1).wrapped_count(clear_limit=False), 1)
+
     def test_ordering(self):
         u1 = User.create(username='u1')
         u2 = User.create(username='u2')
@@ -2710,64 +2724,62 @@ class TransactionTestCase(ModelTestCase):
 
         @test_db.commit_on_success
         def will_fail():
-            u = User.create(username='u1')
-            b = Blog.create() # no blog, will raise an error
-            return u, b
+            User.create(username='u1')
+            Blog.create() # no blog, will raise an error
 
-        self.assertRaises(Exception, will_fail)
+        self.assertRaises(IntegrityError, will_fail)
         self.assertEqual(User.select().count(), 0)
         self.assertEqual(Blog.select().count(), 0)
 
         @test_db.commit_on_success
         def will_succeed():
             u = User.create(username='u1')
-            b = Blog.create(title='b1', user=u)
-            return u, b
+            Blog.create(title='b1', user=u)
 
-        u, b = will_succeed()
+        will_succeed()
         self.assertEqual(User.select().count(), 1)
         self.assertEqual(Blog.select().count(), 1)
 
     def test_context_mgr(self):
-        def will_fail():
-            u = User.create(username='u1')
-            b = Blog.create() # no blog, will raise an error
-            return u, b
-
         def do_will_fail():
-            with transaction(test_db):
-                will_fail()
-
-        def do_will_fail2():
             with test_db.transaction():
-                will_fail()
+                User.create(username='u1')
+                Blog.create() # no blog, will raise an error
 
-        self.assertRaises(Exception, do_will_fail)
+        self.assertRaises(IntegrityError, do_will_fail)
         self.assertEqual(Blog.select().count(), 0)
-
-        self.assertRaises(Exception, do_will_fail2)
-        self.assertEqual(Blog.select().count(), 0)
-
-        def will_succeed():
-            u = User.create(username='u1')
-            b = Blog.create(title='b1', user=u)
-            return u, b
 
         def do_will_succeed():
             with transaction(test_db):
-                will_succeed()
-
-        def do_will_succeed2():
-            with test_db.transaction():
-                will_succeed()
+                u = User.create(username='u1')
+                Blog.create(title='b1', user=u)
 
         do_will_succeed()
         self.assertEqual(User.select().count(), 1)
         self.assertEqual(Blog.select().count(), 1)
 
-        do_will_succeed2()
+    def test_nesting_transactions(self):
+        @test_db.commit_on_success
+        def outer(should_fail=False):
+            self.assertEqual(test_db.transaction_depth(), 1)
+            User.create(username='outer')
+            inner(should_fail)
+            self.assertEqual(test_db.transaction_depth(), 1)
+
+        @test_db.commit_on_success
+        def inner(should_fail):
+            self.assertEqual(test_db.transaction_depth(), 2)
+            User.create(username='inner')
+            if should_fail:
+                raise ValueError('failing')
+
+        self.assertRaises(ValueError, outer, should_fail=True)
+        self.assertEqual(User.select().count(), 0)
+        self.assertEqual(test_db.transaction_depth(), 0)
+
+        outer(should_fail=False)
         self.assertEqual(User.select().count(), 2)
-        self.assertEqual(Blog.select().count(), 2)
+        self.assertEqual(test_db.transaction_depth(), 0)
 
 
 class ConcurrencyTestCase(ModelTestCase):
@@ -3212,3 +3224,56 @@ if database_class is PostgresqlDatabase:
 
             u = User.get(User.id == self.user.id)
             self.assertEqual(u.username, self.user.username)
+
+if test_db.savepoints:
+    class TestSavepoints(ModelTestCase):
+        requires = [User]
+
+        def _outer(self, fail_outer=False, fail_inner=False):
+            with test_db.savepoint():
+                User.create(username='outer')
+                try:
+                    self._inner(fail_inner)
+                except ValueError:
+                    pass
+                if fail_outer:
+                    raise ValueError
+
+        def _inner(self, fail_inner):
+            with test_db.savepoint():
+                User.create(username='inner')
+                if fail_inner:
+                    raise ValueError('failing')
+
+        def assertNames(self, expected):
+            query = User.select().order_by(User.username)
+            self.assertEqual([u.username for u in query], expected)
+
+        def test_success(self):
+            with test_db.transaction():
+                self._outer()
+                self.assertEqual(User.select().count(), 2)
+            self.assertNames(['inner', 'outer'])
+
+        def test_inner_failure(self):
+            with test_db.transaction():
+                self._outer(fail_inner=True)
+                self.assertEqual(User.select().count(), 1)
+            self.assertNames(['outer'])
+
+        def test_outer_failure(self):
+            # Because the outer savepoint is rolled back, we'll lose the
+            # inner savepoint as well.
+            with test_db.transaction():
+                self.assertRaises(ValueError, self._outer, fail_outer=True)
+                self.assertEqual(User.select().count(), 0)
+
+        def test_failure(self):
+            with test_db.transaction():
+                self.assertRaises(
+                    ValueError, self._outer, fail_outer=True, fail_inner=True)
+                self.assertEqual(User.select().count(), 0)
+
+
+elif TEST_VERBOSITY > 0:
+    print_('Skipping "savepoint" tests')

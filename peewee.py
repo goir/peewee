@@ -14,6 +14,7 @@ import operator
 import re
 import sys
 import threading
+import uuid
 from collections import deque
 from collections import namedtuple
 from copy import deepcopy
@@ -27,6 +28,8 @@ __all__ = [
     'CharField',
     'Clause',
     'CompositeKey',
+    'DatabaseError',
+    'DataError',
     'DateField',
     'DateTimeField',
     'DecimalField',
@@ -40,14 +43,21 @@ __all__ = [
     'ForeignKeyField',
     'ImproperlyConfigured',
     'IntegerField',
+    'IntegrityError',
+    'InterfaceError',
+    'InternalError',
     'JOIN_FULL',
     'JOIN_INNER',
     'JOIN_LEFT_OUTER',
     'Model',
     'MySQLDatabase',
+    'NotSupportedError',
+    'OperationalError',
+    'Param',
     'PostgresqlDatabase',
     'prefetch',
     'PrimaryKeyField',
+    'ProgrammingError',
     'R',
     'SqliteDatabase',
     'TextField',
@@ -69,6 +79,10 @@ if PY3:
     basestring = str
     print_ = getattr(builtins, 'print')
     binary_construct = lambda s: bytes(s.encode('raw_unicode_escape'))
+    def reraise(tp, value, tb=None):
+        if value.__traceback__ is not tb:
+            raise value.with_traceback(tb)
+        raise value
 else:
     unicode_type = unicode
     string_type = basestring
@@ -76,12 +90,10 @@ else:
     def print_(s):
         sys.stdout.write(s)
         sys.stdout.write('\n')
+    exec('def reraise(tp, value, tb=None): raise tp, value, tb')
 
 # DB libraries
-try:
-    import sqlite3
-except ImportError:
-    sqlite3 = None
+import sqlite3
 
 try:
     import psycopg2
@@ -646,7 +658,7 @@ class ReverseRelationDescriptor(object):
 
     def __get__(self, instance, instance_type=None):
         if instance is not None:
-            return self.rel_model.select().where(self.field==instance.get_id())
+            return self.rel_model.select().where(self.field == instance.get_id())
         return self
 
 class ForeignKeyField(IntegerField):
@@ -838,6 +850,7 @@ class QueryCompiler(object):
                 node.nodes, alias_map, conv, ' ')
         elif isinstance(node, Param):
             params = [node.value]
+            unknown = True
         elif isinstance(node, R):
             sql = node.value
             params = []
@@ -899,7 +912,7 @@ class QueryCompiler(object):
             # here, if the node is *not* a special object, we'll pass thru
             # parse_node and let db_value handle it
             if not isinstance(value, (Node, Model, Query)):
-                value = Param(value)  # passthru to the field's db_value func
+                value = Param(value) # passthru to the field's db_value func
             val_sql, val_params = self.parse_node(value)
             val_params = [field.db_value(vp) for vp in val_params]
             sets.append((field_sql, val_sql))
@@ -951,15 +964,22 @@ class QueryCompiler(object):
                         right_field = field
                     join_node = (left_field == right_field)
 
+                if hasattr(dest._meta.db_table, 'sql'):
+                    f_part, f_params = dest._meta.db_table.sql()
+                    f_part = "(%s)" % f_part
+                else:
+                    f_part = self.quote(dest._meta.db_table)
+                    f_params = []
+
                 join_type = join.join_type or JOIN_INNER
                 join_sql, join_params = self.parse_node(join_node, alias_map)
-
+                f_params.extend(join_params)
                 sql.append('%s JOIN %s AS %s ON %s' % (
                     self.join_map[join_type],
-                    self.quote(dest._meta.db_table),
+                    f_part,
                     alias_map[dest],
                     join_sql))
-                params.extend(join_params)
+                params.extend(f_params)
 
                 q.append(dest)
         return sql, params
@@ -1667,9 +1687,10 @@ class SelectQuery(Query):
         # defaults to a count() of the primary key
         return self.aggregate(convert=False) or 0
 
-    def wrapped_count(self):
+    def wrapped_count(self, clear_limit=True):
         clone = self.order_by()
-        clone._limit = clone._offset = None
+        if clear_limit:
+            clone._limit = clone._offset = None
 
         sql, params = clone.sql()
         wrapped = 'SELECT COUNT(1) FROM (%s) AS wrapped_select' % sql
@@ -1793,6 +1814,31 @@ class DeleteQuery(Query):
         return self.database.rows_affected(self._execute())
 
 
+class PeeweeException(Exception): pass
+class DatabaseError(PeeweeException): pass
+class DataError(DatabaseError): pass
+class IntegrityError(DatabaseError): pass
+class InterfaceError(PeeweeException): pass
+class InternalError(DatabaseError): pass
+class NotSupportedError(DatabaseError): pass
+class OperationalError(DatabaseError): pass
+class ProgrammingError(DatabaseError): pass
+
+class ExceptionWrapper(object):
+    __slots__ = ['exceptions']
+
+    def __init__(self, exceptions):
+        self.exceptions = exceptions
+
+    def __enter__(self): pass
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            return
+        if exc_type.__name__ in self.exceptions:
+            new_type = self.exceptions[exc_type.__name__]
+            reraise(new_type, new_type(*exc_value.args), traceback)
+
+
 class Database(object):
     commit_select = False
     compiler_class = QueryCompiler
@@ -1803,8 +1849,19 @@ class Database(object):
     op_overrides = {}
     quote_char = '"'
     reserved_tables = []
+    savepoints = True
     sequences = False
     subquery_delete_same_table = True
+
+    exceptions = {
+        'DatabaseError': DatabaseError,
+        'DataError': DataError,
+        'IntegrityError': IntegrityError,
+        'InterfaceError': InterfaceError,
+        'InternalError': InternalError,
+        'NotSupportedError': NotSupportedError,
+        'OperationalError': OperationalError,
+        'ProgrammingError': ProgrammingError}
 
     def __init__(self, database, threadlocals=False, autocommit=True,
                  fields=None, ops=None, **connect_kwargs):
@@ -1826,23 +1883,28 @@ class Database(object):
         self.database = database
         self.connect_kwargs = connect_kwargs
 
+    def exception_wrapper(self):
+        return ExceptionWrapper(self.exceptions)
+
     def connect(self):
         with self._conn_lock:
             if self.deferred:
                 raise Exception('Error, database not properly initialized '
                                 'before opening connection')
-            self.__local.conn = self._connect(
-                self.database,
-                **self.connect_kwargs)
-            self.__local.closed = False
+            with self.exception_wrapper():
+                self.__local.conn = self._connect(
+                    self.database,
+                    **self.connect_kwargs)
+                self.__local.closed = False
 
     def close(self):
         with self._conn_lock:
             if self.deferred:
                 raise Exception('Error, database not properly initialized '
                                 'before closing connection')
-            self._close(self.__local.conn)
-            self.__local.closed = True
+            with self.exception_wrapper():
+                self._close(self.__local.conn)
+                self.__local.closed = True
 
     def get_conn(self):
         if not hasattr(self.__local, 'closed') or self.__local.closed:
@@ -1877,7 +1939,7 @@ class Database(object):
         return cursor.rowcount
 
     def sql_error_handler(self, exception, sql, params, require_commit):
-        raise exception
+        return True
 
     def compiler(self):
         return self.compiler_class(
@@ -1886,14 +1948,17 @@ class Database(object):
 
     def execute_sql(self, sql, params=None, require_commit=True):
         logger.debug((sql, params))
-        cursor = self.get_cursor()
-        try:
-            res = cursor.execute(sql, params or ())
-        except Exception as exc:
-            logger.error('Error executing query %s (%s)' % (sql, params))
-            return self.sql_error_handler(exc, sql, params, require_commit)
-        if require_commit and self.get_autocommit():
-            self.commit()
+        with self.exception_wrapper():
+            cursor = self.get_cursor()
+            try:
+                res = cursor.execute(sql, params or ())
+            except Exception as exc:
+                logger.exception('%s %s', sql, params)
+                if self.sql_error_handler(exc, sql, params, require_commit):
+                    raise
+            else:
+                if require_commit and self.get_autocommit():
+                    self.commit()
         return cursor
 
     def begin(self):
@@ -1913,25 +1978,30 @@ class Database(object):
             self.set_autocommit(self.autocommit)
         return self.__local.autocommit
 
+    def push_transaction(self, transaction):
+        if not hasattr(self.__local, 'transactions'):
+            self.__local.transactions = []
+        self.__local.transactions.append(transaction)
+
+    def pop_transaction(self):
+        self.__local.transactions.pop()
+
+    def transaction_depth(self):
+        return len(getattr(self.__local, 'transactions', ()))
+
     def transaction(self):
         return transaction(self)
 
     def commit_on_success(self, func):
         def inner(*args, **kwargs):
-            orig = self.get_autocommit()
-            self.set_autocommit(False)
-            self.begin()
-            try:
-                res = func(*args, **kwargs)
-                self.commit()
-            except:
-                self.rollback()
-                raise
-            else:
-                return res
-            finally:
-                self.set_autocommit(orig)
+            with self.transaction():
+                return func(*args, **kwargs)
         return inner
+
+    def savepoint(self, sid=None):
+        if not self.savepoints:
+            raise NotImplementedError
+        return savepoint(self, sid)
 
     def get_tables(self):
         raise NotImplementedError
@@ -1983,8 +2053,6 @@ class SqliteDatabase(Database):
         OP_LIKE: 'GLOB',
         OP_ILIKE: 'LIKE',
     }
-    if sqlite3:
-        ConnectionError = sqlite3.OperationalError
 
     def _connect(self, database, **kwargs):
         if not sqlite3:
@@ -2002,6 +2070,9 @@ class SqliteDatabase(Database):
         res = self.execute_sql('select name from sqlite_master where '
                                'type="table" order by name;')
         return [r[0] for r in res.fetchall()]
+
+    def savepoint(self, sid=None):
+        return savepoint_sqlite(self, sid)
 
     def extract_date(self, date_part, date_field):
         return fn.date_part(date_part, date_field)
@@ -2091,7 +2162,7 @@ class MySQLDatabase(Database):
     }
     for_update = True
     interpolation = '%s'
-    limit_max = 2 ** 64 - 1  # MySQL quirk
+    limit_max = 2 ** 64 - 1 # MySQL quirk
     op_overrides = {
         OP_LIKE: 'LIKE BINARY',
         OP_ILIKE: 'LIKE',
@@ -2154,21 +2225,80 @@ class transaction(object):
     def __init__(self, db):
         self.db = db
 
+    def _begin(self):
+        self.db.begin()
+
     def __enter__(self):
         self._orig = self.db.get_autocommit()
         self.db.set_autocommit(False)
-        self.db.begin()
+        if self.db.transaction_depth() == 0:
+            self._begin()
+        self.db.push_transaction(self)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        success = True
-        if exc_type:
-            self.db.rollback()
-            success = False
-        else:
-            self.db.commit()
-        self.db.set_autocommit(self._orig)
-        return success
+        try:
+            if exc_type:
+                self.db.rollback()
+            elif self.db.transaction_depth() == 1:
+                try:
+                    self.db.commit()
+                except:
+                    self.db.rollback()
+                    raise
+        finally:
+            self.db.set_autocommit(self._orig)
+            self.db.pop_transaction()
 
+
+class savepoint(object):
+    def __init__(self, db, sid=None):
+        self.db = db
+        _compiler = db.compiler()
+        self.sid = sid or 's' + uuid.uuid4().get_hex()
+        self.quoted_sid = _compiler.quote(self.sid)
+
+    def _execute(self, query):
+        self.db.execute_sql(query, require_commit=False)
+
+    def __enter__(self):
+        self._orig_autocommit = self.db.get_autocommit()
+        self.db.set_autocommit(False)
+        self._execute('SAVEPOINT %s;' % self.quoted_sid)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type:
+                self._execute('ROLLBACK TO SAVEPOINT %s;' % self.quoted_sid)
+            else:
+                try:
+                    self._execute('RELEASE SAVEPOINT %s;' % self.quoted_sid)
+                except:
+                    self._execute(
+                        'ROLLBACK TO SAVEPOINT %s;' % self.quoted_sid)
+                    raise
+        finally:
+            self.db.set_autocommit(self._orig_autocommit)
+
+class savepoint_sqlite(savepoint):
+    def __enter__(self):
+        conn = self.db.get_conn()
+        # For sqlite, the connection's isolation_level *must* be set to None.
+        # The act of setting it, though, will break any existing savepoints,
+        # so only write to it if necessary.
+        if conn.isolation_level is not None:
+            self._orig_isolation_level = conn.isolation_level
+            conn.isolation_level = None
+        else:
+            self._orig_isolation_level = None
+        super(savepoint_sqlite, self).__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super(savepoint_sqlite, self).__exit__(
+                exc_type, exc_val, exc_tb)
+        finally:
+            if self._orig_isolation_level is not None:
+                self.db.get_conn().isolation_level = self._orig_isolation_level
 
 class FieldProxy(Field):
     def __init__(self, alias, field_instance):
@@ -2200,6 +2330,12 @@ class ModelAlias(object):
     def get_proxy_fields(self):
         return [
             FieldProxy(self, f) for f in self.model_class._meta.get_fields()]
+
+    def select(self, *selection):
+        query = SelectQuery(self, *selection)
+        if self._meta.order_by:
+            query = query.order_by(*self._meta.order_by)
+        return query
 
 
 class DoesNotExist(Exception): pass
@@ -2599,9 +2735,9 @@ def sort_models_topologically(models):
             seen.add(model)
             for foreign_key in model._meta.reverse_rel.values():
                 dfs(foreign_key.model_class)
-            ordering.append(model)  # parent will follow descendants
+            ordering.append(model) # parent will follow descendants
     # order models by name and table initially to guarantee a total ordering
     names = lambda m: (m._meta.name, m._meta.db_table)
     for m in sorted(models, key=names, reverse=True):
         dfs(m)
-    return list(reversed(ordering))  # want parents first in output ordering
+    return list(reversed(ordering)) # want parents first in output ordering
